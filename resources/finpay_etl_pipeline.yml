@@ -1,0 +1,23 @@
+resources:
+  pipelines:
+    finpay_etl_pipeline:
+      name: finpay_etl_pipeline
+      catalog: fintech_finpay
+      schema: bronze
+      development: true
+      continuous: false
+      serverless: true
+
+      libraries:
+        - file:
+            path: ../src/bronze.py
+        - file:
+            path: ../src/silver.py
+        - file:
+            path: ../src/gold.py
+        - file:
+            path: ../src/utils.py
+
+      configuration:
+        landing_path: /Volumes/fintech_finpay/default/vol_landing
+        observability_schema: fintech_finpay.observability

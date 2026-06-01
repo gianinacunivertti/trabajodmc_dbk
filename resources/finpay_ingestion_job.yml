@@ -1,0 +1,16 @@
+resources:
+  jobs:
+    finpay_ingestion_job:
+      name: finpay_ingestion_job
+
+      tasks:
+        - task_key: run_finpay_etl_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.finpay_etl_pipeline.id}
+            full_refresh: false
+
+      max_concurrent_runs: 1
+
+      email_notifications:
+        on_failure:
+          - gianinacuni@gmail.com
