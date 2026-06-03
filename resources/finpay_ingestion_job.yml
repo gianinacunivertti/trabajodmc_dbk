@@ -4,8 +4,18 @@ resources:
       name: finpay_ingestion_job
       max_concurrent_runs: 1
 
+      email_notifications:
+        on_failure:
+          - gianinacuni@gmail.com
+
       tasks:
         - task_key: run_finpay_etl_pipeline
+          description: "Ejecuta el Lakeflow Declarative Pipeline FinPay Bronze, Silver y Gold."
           pipeline_task:
             pipeline_id: ${resources.pipelines.finpay_etl_pipeline.id}
             full_refresh: false
+
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: true
+          timeout_seconds: 7200

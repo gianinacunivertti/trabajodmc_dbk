@@ -2,7 +2,8 @@
 # ============================================================
 # 00_setup.py
 # Proyecto FinPay - Lakehouse Fraud Detection
-# Setup inicial de catalogos, schemas, volume, carpetas y metadata
+# Setup inicial de catalogos, schemas, volume, carpetas,
+# metadata, permisos y seguridad Unity Catalog
 # Compatible con dev/prod mediante parametro catalog
 # ============================================================
 
@@ -169,7 +170,9 @@ users_path = f"{LANDING_PATH}/users/users_sample.txt"
 
 # COMMAND ----------
 
+# ------------------------------------------------------------
 # Transactions CSV
+# ------------------------------------------------------------
 
 transactions_csv = """transaction_id,user_id,merchant_id,channel,transaction_type,amount,currency,transaction_date,status,reference_id
 TXN-20260530-00001,USR-000001,MCH-00001,app,pago,120.50,PEN,2026-05-30,aprobado,
@@ -184,8 +187,10 @@ print(f"Transactions sample creado: {transactions_path}")
 
 # COMMAND ----------
 
+# ------------------------------------------------------------
 # Merchants JSON
 # Se escribe como JSON lines para facilitar lectura con Auto Loader JSON.
+# ------------------------------------------------------------
 
 merchants_jsonl = """{"merchant_id":"MCH-00001","merchant_name":"Comercio Lima Centro","category":"retail","country":"PE","affiliation_date":"2025-01-15","status":"activo","risk_level":"bajo"}
 {"merchant_id":"MCH-00002","merchant_name":"Fintech Market","category":"tecnologia","country":"PE","affiliation_date":"2025-03-10","status":"activo","risk_level":"medio"}
@@ -197,7 +202,9 @@ print(f"Merchants sample creado: {merchants_path}")
 
 # COMMAND ----------
 
+# ------------------------------------------------------------
 # Users TXT delimitado por |
+# ------------------------------------------------------------
 
 users_txt = """user_id|full_name|document_id|email|phone|country|segment|registration_date
 USR-000001|Ana Perez|DNI12345678|ana.perez@example.com|+51987654321|PE|premium|2025-01-01
@@ -230,8 +237,12 @@ display(dbutils.fs.ls(f"{LANDING_PATH}/metadata"))
 # COMMAND ----------
 
 # ------------------------------------------------------------
-# Permisos opcionales
+# Permisos por rol
 # Si los grupos no existen, se omiten sin detener el setup.
+# Roles esperados:
+# - ingenieria
+# - riesgo
+# - auditoria
 # ------------------------------------------------------------
 
 groups = ["ingenieria", "riesgo", "auditoria"]
@@ -241,17 +252,84 @@ for group_name in groups:
         spark.sql(f"GRANT USE CATALOG ON CATALOG {CATALOG} TO `{group_name}`")
         print(f"Permiso USE CATALOG asignado a {group_name}")
     except Exception as e:
-        print(f"No se pudo asignar permiso a grupo {group_name}: {str(e)}")
+        print(f"No se pudo asignar USE CATALOG a {group_name}: {str(e)}")
 
 # COMMAND ----------
 
 # ------------------------------------------------------------
-# Funciones de gobernanza opcionales
-# Masking function y row filter function
+# Permisos para ingenieria
+# USE CATALOG, USE SCHEMA, CREATE TABLE, MODIFY en todos los schemas
+# ------------------------------------------------------------
+
+try:
+    for schema_name in [
+        SCHEMA_DEFAULT,
+        SCHEMA_BRONZE,
+        SCHEMA_SILVER,
+        SCHEMA_GOLD,
+        SCHEMA_OBSERVABILITY
+    ]:
+        spark.sql(f"GRANT USE SCHEMA ON SCHEMA {CATALOG}.{schema_name} TO `ingenieria`")
+        spark.sql(f"GRANT CREATE TABLE ON SCHEMA {CATALOG}.{schema_name} TO `ingenieria`")
+        spark.sql(f"GRANT MODIFY ON SCHEMA {CATALOG}.{schema_name} TO `ingenieria`")
+
+    print("Permisos asignados a ingenieria.")
+except Exception as e:
+    print(f"No se pudieron asignar todos los permisos a ingenieria: {str(e)}")
+
+# COMMAND ----------
+
+# ------------------------------------------------------------
+# Permisos para riesgo
+# USE CATALOG, USE SCHEMA, SELECT en silver y gold
+# ------------------------------------------------------------
+
+try:
+    for schema_name in [SCHEMA_SILVER, SCHEMA_GOLD]:
+        spark.sql(f"GRANT USE SCHEMA ON SCHEMA {CATALOG}.{schema_name} TO `riesgo`")
+        spark.sql(f"GRANT SELECT ON SCHEMA {CATALOG}.{schema_name} TO `riesgo`")
+
+    print("Permisos asignados a riesgo.")
+except Exception as e:
+    print(f"No se pudieron asignar todos los permisos a riesgo: {str(e)}")
+
+# COMMAND ----------
+
+# ------------------------------------------------------------
+# Permisos para auditoria
+# USE CATALOG, USE SCHEMA, SELECT en gold y observability
+# ------------------------------------------------------------
+
+try:
+    for schema_name in [SCHEMA_GOLD, SCHEMA_OBSERVABILITY]:
+        spark.sql(f"GRANT USE SCHEMA ON SCHEMA {CATALOG}.{schema_name} TO `auditoria`")
+        spark.sql(f"GRANT SELECT ON SCHEMA {CATALOG}.{schema_name} TO `auditoria`")
+
+    print("Permisos asignados a auditoria.")
+except Exception as e:
+    print(f"No se pudieron asignar todos los permisos a auditoria: {str(e)}")
+
+# COMMAND ----------
+
+# ============================================================
+# SEGURIDAD UNITY CATALOG SOBRE SILVER.USERS
+# Column Masking + Row-Level Security
+# ============================================================
+# Requisito del proyecto:
+# - Tabla: {CATALOG}.silver.users
+# - Campos PII bajo masking:
+#   full_name, document_id, email, phone
+# - Solo el rol/grupo ingenieria puede ver valores reales.
+# - Aplicar row-level security mediante SET ROW FILTER.
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Crear funcion de masking en schema silver
 # ------------------------------------------------------------
 
 spark.sql(f"""
-CREATE OR REPLACE FUNCTION {CATALOG}.{SCHEMA_DEFAULT}.mask_pii(value STRING)
+CREATE OR REPLACE FUNCTION {CATALOG}.{SCHEMA_SILVER}.mask_pii(value STRING)
+RETURNS STRING
 RETURN
   CASE
     WHEN is_account_group_member('ingenieria') THEN value
@@ -259,18 +337,96 @@ RETURN
   END
 """)
 
+print(f"Funcion de masking creada: {CATALOG}.{SCHEMA_SILVER}.mask_pii")
+
+# COMMAND ----------
+
+# ------------------------------------------------------------
+# 2. Crear funcion de Row-Level Security en schema silver
+# ------------------------------------------------------------
+# Ingenieria:
+#   Puede ver todas las filas.
+# Riesgo:
+#   Puede ver las filas de paises operativos.
+# Otros:
+#   No ven filas en silver.users.
+# Nota:
+#   Auditoria tiene acceso a gold y observability, no a silver.users.
+# ------------------------------------------------------------
+
 spark.sql(f"""
-CREATE OR REPLACE FUNCTION {CATALOG}.{SCHEMA_DEFAULT}.users_row_filter(country STRING)
+CREATE OR REPLACE FUNCTION {CATALOG}.{SCHEMA_SILVER}.users_row_filter(country STRING)
+RETURNS BOOLEAN
 RETURN
   CASE
     WHEN is_account_group_member('ingenieria') THEN TRUE
-    WHEN is_account_group_member('riesgo') THEN TRUE
-    WHEN is_account_group_member('auditoria') THEN TRUE
+    WHEN is_account_group_member('riesgo') THEN country IN ('PE', 'CO', 'MX', 'CL', 'AR')
     ELSE FALSE
   END
 """)
 
-print("Funciones de gobernanza creadas.")
+print(f"Funcion de row filter creada: {CATALOG}.{SCHEMA_SILVER}.users_row_filter")
+
+# COMMAND ----------
+
+# ------------------------------------------------------------
+# 3. Aplicar Column Masking y Row-Level Security sobre silver.users
+# ------------------------------------------------------------
+# IMPORTANTE:
+# La tabla silver.users se crea cuando corre el Lakeflow Pipeline.
+# Si este setup se ejecuta antes del pipeline, esta parte puede fallar.
+# Por eso se controla con try/except.
+#
+# Despues de ejecutar el pipeline ETL, vuelve a ejecutar esta seccion
+# para aplicar las politicas sobre la tabla ya creada.
+# ------------------------------------------------------------
+
+USERS_TABLE = f"{CATALOG}.{SCHEMA_SILVER}.users"
+MASK_FUNCTION = f"{CATALOG}.{SCHEMA_SILVER}.mask_pii"
+ROW_FILTER_FUNCTION = f"{CATALOG}.{SCHEMA_SILVER}.users_row_filter"
+
+try:
+    # Column masking sobre campos PII
+    spark.sql(f"""
+    ALTER TABLE {USERS_TABLE}
+    ALTER COLUMN full_name
+    SET MASK {MASK_FUNCTION}
+    """)
+
+    spark.sql(f"""
+    ALTER TABLE {USERS_TABLE}
+    ALTER COLUMN document_id
+    SET MASK {MASK_FUNCTION}
+    """)
+
+    spark.sql(f"""
+    ALTER TABLE {USERS_TABLE}
+    ALTER COLUMN email
+    SET MASK {MASK_FUNCTION}
+    """)
+
+    spark.sql(f"""
+    ALTER TABLE {USERS_TABLE}
+    ALTER COLUMN phone
+    SET MASK {MASK_FUNCTION}
+    """)
+
+    # Row-level security
+    spark.sql(f"""
+    ALTER TABLE {USERS_TABLE}
+    SET ROW FILTER {ROW_FILTER_FUNCTION}
+    ON (country)
+    """)
+
+    print(f"Column masking aplicado sobre: full_name, document_id, email, phone")
+    print(f"Row-level security aplicado sobre: {USERS_TABLE}")
+
+except Exception as e:
+    print(f"No se pudo aplicar masking/RLS sobre {USERS_TABLE}.")
+    print("Motivo probable: la tabla silver.users aun no existe.")
+    print("Ejecuta primero el Lakeflow Pipeline y luego vuelve a ejecutar esta seccion.")
+    print("Detalle tecnico:")
+    print(str(e))
 
 # COMMAND ----------
 
@@ -287,6 +443,9 @@ summary = [
     ("observability_schema", f"{CATALOG}.{SCHEMA_OBSERVABILITY}"),
     ("landing_path", LANDING_PATH),
     ("metadata_path", metadata_path),
+    ("mask_function", f"{CATALOG}.{SCHEMA_SILVER}.mask_pii"),
+    ("row_filter_function", f"{CATALOG}.{SCHEMA_SILVER}.users_row_filter"),
+    ("secured_table", f"{CATALOG}.{SCHEMA_SILVER}.users"),
 ]
 
 display(
