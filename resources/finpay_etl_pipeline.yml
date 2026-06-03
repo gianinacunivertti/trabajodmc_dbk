@@ -11,6 +11,11 @@ resources:
       channel: CURRENT
       photon: true
 
+      event_log:
+        catalog: ${var.catalog}
+        schema: observability
+        name: finpay_etl_pipeline_event_log
+
       libraries:
         - file:
             path: ../src/utils.py
@@ -24,3 +29,5 @@ resources:
       configuration:
         spark.databricks.delta.schema.autoMerge.enabled: "true"
         finpay.catalog: "${var.catalog}"
+        finpay.schema: "${var.schema}"
+        finpay.observability_schema: "observability"
