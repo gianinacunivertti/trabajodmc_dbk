@@ -23,7 +23,9 @@ from pyspark.sql.functions import (
     current_timestamp,
     sha2,
     concat_ws,
-    lit
+    lit,
+    to_json,
+    struct
 )
 
 
@@ -31,7 +33,11 @@ from pyspark.sql.functions import (
 # CONFIGURACION GENERAL DEL PROYECTO
 # ============================================================
 
-CATALOG = "fintech_finpay"
+# ============================================================
+# CONFIGURACION GENERAL DEL PROYECTO
+# ============================================================
+
+CATALOG = "fintech_finpay_prod"
 
 DEFAULT_SCHEMA = "default"
 BRONZE_SCHEMA = "bronze"
@@ -42,68 +48,52 @@ OBSERVABILITY_SCHEMA = "observability"
 LANDING_PATH = f"/Volumes/{CATALOG}/{DEFAULT_SCHEMA}/vol_landing"
 ARCHETYPE_PATH = f"{LANDING_PATH}/metadata/ingestion_archetypes.json"
 
-
 # ============================================================
-# NOMBRES FULLY-QUALIFIED DE TABLAS BRONZE
-# ============================================================
-
-BRONZE_TRANSACTIONS = f"{CATALOG}.{BRONZE_SCHEMA}.transactions"
-BRONZE_MERCHANTS = f"{CATALOG}.{BRONZE_SCHEMA}.merchants"
-BRONZE_USERS = f"{CATALOG}.{BRONZE_SCHEMA}.users"
-
-
-# ============================================================
-# NOMBRES FULLY-QUALIFIED DE TABLAS SILVER
+# NOMBRES LOGICOS DE TABLAS BRONZE
+# Estas son las tablas que crea bronze.py
 # ============================================================
 
-SILVER_TRANSACTIONS = f"{CATALOG}.{SILVER_SCHEMA}.silver_transactions"
-SILVER_MERCHANTS = f"{CATALOG}.{SILVER_SCHEMA}.silver_merchants"
-SILVER_USERS = f"{CATALOG}.{SILVER_SCHEMA}.silver_users"
-SILVER_QUARANTINE = f"{CATALOG}.{SILVER_SCHEMA}.quarantine"
+BRONZE_TRANSACTIONS = f"{CATALOG}.bronze.bronze_transactions_raw"
+BRONZE_MERCHANTS = f"{CATALOG}.bronze.bronze_merchants_raw"
+BRONZE_USERS = f"{CATALOG}.bronze.bronze_users_raw"
 
 
 # ============================================================
-# NOMBRES FULLY-QUALIFIED DE TABLAS GOLD
+# NOMBRES LOGICOS DE TABLAS SILVER
+# Estas son las tablas que crea silver.py
 # ============================================================
 
-GOLD_RISK_KPIS_BY_MERCHANT_CHANNEL = (
-    f"{CATALOG}.{GOLD_SCHEMA}.gold_risk_kpis_by_merchant_channel"
-)
+SILVER_TRANSACTIONS = f"{CATALOG}.silver.transactions"
+SILVER_MERCHANTS = f"{CATALOG}.silver.merchants"
+SILVER_USERS = f"{CATALOG}.silver.users"
 
-GOLD_DAILY_RISK_SUMMARY = (
-    f"{CATALOG}.{GOLD_SCHEMA}.gold_daily_risk_summary"
-)
+SILVER_QUARANTINE = f"{CATALOG}.silver.quarantine"
+SILVER_QUARANTINE_TRANSACTIONS = f"{CATALOG}.silver.quarantine_transactions"
+SILVER_QUARANTINE_MERCHANTS = f"{CATALOG}.silver.quarantine_merchants"
+SILVER_QUARANTINE_USERS = f"{CATALOG}.silver.quarantine_users"
 
-GOLD_MERCHANT_ANOMALY_CANDIDATES = (
-    f"{CATALOG}.{GOLD_SCHEMA}.gold_merchant_anomaly_candidates"
-)
+# ============================================================
+# NOMBRES LOGICOS DE TABLAS GOLD
+# Estas son las tablas que crea gold.py
+# ============================================================
 
-GOLD_USER_RISK_SUMMARY = (
-    f"{CATALOG}.{GOLD_SCHEMA}.gold_user_risk_summary"
-)
-
-GOLD_COUNTRY_CATEGORY_RISK_SUMMARY = (
-    f"{CATALOG}.{GOLD_SCHEMA}.gold_country_category_risk_summary"
-)
-
-GOLD_DATE_SUMMARY = (
-    f"{CATALOG}.{GOLD_SCHEMA}.gold_date_summary"
-)
+GOLD_RISK_KPIS_BY_MERCHANT_CHANNEL = f"{CATALOG}.gold.risk_kpis_by_merchant_channel"
+GOLD_DAILY_REVERSAL_RATE = f"{CATALOG}.gold.daily_reversal_rate"
+GOLD_MERCHANT_ANOMALY_CANDIDATES = f"{CATALOG}.gold.merchant_anomaly_candidates"
+GOLD_USER_CHANNEL_SUMMARY = f"{CATALOG}.gold.user_channel_summary"
 
 
 # ============================================================
 # OBSERVABILIDAD
 # ============================================================
 
-OBSERVABILITY_EVENT_LOG = (
-    f"{CATALOG}.{OBSERVABILITY_SCHEMA}.pipeline_event_log"
-)
+OBSERVABILITY_EVENT_LOG = f"{CATALOG}.{OBSERVABILITY_SCHEMA}.pipeline_event_log"
 
 
 # ============================================================
 # SCHEMAS RAW BRONZE
 # En Bronze todos los campos llegan como STRING.
-# El casteo real se hace en Silver.
+# El casteo y validacion real se hacen en Silver.
 # ============================================================
 
 TRANSACTIONS_BRONZE_SCHEMA = StructType([
@@ -119,7 +109,6 @@ TRANSACTIONS_BRONZE_SCHEMA = StructType([
     StructField("reference_id", StringType(), True)
 ])
 
-
 MERCHANTS_BRONZE_SCHEMA = StructType([
     StructField("merchant_id", StringType(), True),
     StructField("merchant_name", StringType(), True),
@@ -129,7 +118,6 @@ MERCHANTS_BRONZE_SCHEMA = StructType([
     StructField("status", StringType(), True),
     StructField("risk_level", StringType(), True)
 ])
-
 
 USERS_BRONZE_SCHEMA = StructType([
     StructField("user_id", StringType(), True),
@@ -145,12 +133,15 @@ USERS_BRONZE_SCHEMA = StructType([
 
 # ============================================================
 # FUNCIONES PARA INGESTA METADATA-DRIVEN
+# Se conservan para documentar y validar el arquetipo,
+# aunque bronze.py ahora declara tablas explicitas.
 # ============================================================
 
 def get_schema_by_source(source_name: str):
     """
     Retorna el schema Bronze correspondiente a cada fuente.
     """
+
     source_name = str(source_name).strip().lower()
 
     if source_name == "transactions":
@@ -167,9 +158,9 @@ def get_schema_by_source(source_name: str):
 
 def get_bronze_table_name_by_source(source_name: str):
     """
-    Retorna el nombre fully-qualified de la tabla Bronze
-    para cada fuente.
+    Retorna el nombre logico de la tabla Bronze.
     """
+
     source_name = str(source_name).strip().lower()
 
     if source_name == "transactions":
@@ -189,14 +180,44 @@ def read_ingestion_archetypes():
     Lee el archivo metadata-driven ingestion_archetypes.json
     desde la landing zone.
     """
-    with open(ARCHETYPE_PATH, "r") as file:
+
+    with open(ARCHETYPE_PATH, "r", encoding="utf-8") as file:
         archetypes = json.load(file)
 
-    return [
+    if not isinstance(archetypes, list):
+        raise TypeError("ingestion_archetypes.json debe ser una lista JSON.")
+
+    active_archetypes = [
         archetype
         for archetype in archetypes
-        if archetype.get("active") is True
+        if isinstance(archetype, dict) and archetype.get("active") is True
     ]
+
+    if len(active_archetypes) == 0:
+        raise ValueError("No hay fuentes activas en ingestion_archetypes.json.")
+
+    required_fields = [
+        "source_name",
+        "source_path",
+        "file_format",
+        "target_table",
+        "active"
+    ]
+
+    for archetype in active_archetypes:
+        missing_fields = [
+            field
+            for field in required_fields
+            if field not in archetype or archetype[field] in [None, ""]
+        ]
+
+        if missing_fields:
+            raise ValueError(
+                f"Arquetipo incompleto: {archetype}. "
+                f"Campos faltantes: {missing_fields}"
+            )
+
+    return active_archetypes
 
 
 # ============================================================
@@ -206,30 +227,29 @@ def read_ingestion_archetypes():
 def add_audit_columns(df, source_name: str):
     """
     Agrega columnas tecnicas de auditoria en Bronze.
-
-    Nota:
-    En Unity Catalog no se debe usar input_file_name().
-    Se usa _metadata.file_path.
+    Usa _metadata.file_path, disponible cuando se lee con Auto Loader.
     """
+
     data_columns = [
         c for c in df.columns
         if c != "_metadata"
     ]
 
     return (
-        df.withColumn("_source_name", lit(source_name))
-          .withColumn("_source_file", col("_metadata.file_path"))
-          .withColumn("_ingestion_timestamp", current_timestamp())
-          .withColumn(
-              "_record_hash",
-              sha2(
-                  concat_ws(
-                      "||",
-                      *[col(c).cast("string") for c in data_columns]
-                  ),
-                  256
-              )
-          )
+        df
+        .withColumn("_source_name", lit(source_name))
+        .withColumn("_source_file", col("_metadata.file_path"))
+        .withColumn("_ingestion_timestamp", current_timestamp())
+        .withColumn(
+            "_record_hash",
+            sha2(
+                concat_ws(
+                    "||",
+                    *[col(c).cast("string") for c in data_columns]
+                ),
+                256
+            )
+        )
     )
 
 
@@ -239,9 +259,13 @@ def add_audit_columns(df, source_name: str):
 
 def clean_string(column_name: str):
     """
-    Limpia espacios en blanco al inicio y final.
+    Limpia espacios al inicio y final.
+    Convierte cadenas vacias a NULL.
     """
-    return trim(col(column_name))
+
+    cleaned = trim(col(column_name))
+
+    return when(cleaned == "", lit(None)).otherwise(cleaned)
 
 
 def normalize_code(column_name: str):
@@ -249,23 +273,37 @@ def normalize_code(column_name: str):
     Normaliza codigos a mayusculas.
     Ejemplo: pais, moneda.
     """
-    return upper(trim(col(column_name)))
+
+    cleaned = upper(trim(col(column_name)))
+
+    return when(cleaned == "", lit(None)).otherwise(cleaned)
 
 
 def normalize_lower(column_name: str):
     """
-    Normaliza textos categóricos a minusculas.
+    Normaliza textos categoricos a minusculas.
     Ejemplo: canal, estado, tipo de transaccion.
     """
-    return lower(trim(col(column_name)))
+
+    cleaned = lower(trim(col(column_name)))
+
+    return when(cleaned == "", lit(None)).otherwise(cleaned)
 
 
 def parse_amount(column_name: str):
     """
     Convierte montos recibidos como texto a decimal(18,2).
-    Soporta coma decimal reemplazandola por punto.
+    Limpia simbolos de moneda y caracteres no numericos.
     """
-    return regexp_replace(col(column_name), ",", ".").cast("decimal(18,2)")
+
+    clean_col = regexp_replace(col(column_name), r"[^0-9\.\-]", "")
+
+    return when(
+        clean_col == "",
+        lit(None).cast("decimal(18,2)")
+    ).otherwise(
+        clean_col.cast("decimal(18,2)")
+    )
 
 
 def parse_date_multi_format(column_name: str):
@@ -275,6 +313,7 @@ def parse_date_multi_format(column_name: str):
     - dd/MM/yyyy
     - yyyyMMdd
     """
+
     return (
         when(
             to_date(col(column_name), "yyyy-MM-dd").isNotNull(),
@@ -293,8 +332,35 @@ def parse_date_multi_format(column_name: str):
 
 
 # ============================================================
+# FUNCION PARA TABLA DE CUARENTENA
+# ============================================================
+
+def quarantine_df(df, source_name: str, rejection_reason: str):
+    """
+    Construye registros rechazados para la tabla de cuarentena.
+    """
+
+    return (
+        df
+        .withColumn("source_name", lit(source_name))
+        .withColumn("rejection_reason", lit(rejection_reason))
+        .withColumn("processing_timestamp", current_timestamp())
+        .withColumn(
+            "raw_record",
+            to_json(struct(*[col(c) for c in df.columns]))
+        )
+        .select(
+            "source_name",
+            "rejection_reason",
+            "processing_timestamp",
+            "raw_record"
+        )
+    )
+
+
+# ============================================================
 # LISTAS DE VALORES VALIDOS
-# Útiles para documentación y validaciones
+# Utiles para validaciones y documentacion
 # ============================================================
 
 VALID_CHANNELS = ["web", "app", "pos"]

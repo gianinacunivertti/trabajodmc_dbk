@@ -1,0 +1,12 @@
+resources:
+  jobs:
+    finpay_setup_job:
+      name: finpay_setup_job
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: run_setup
+          notebook_task:
+            notebook_path: ../notebooks/00_setup.py
+            base_parameters:
+              catalog: ${var.catalog}

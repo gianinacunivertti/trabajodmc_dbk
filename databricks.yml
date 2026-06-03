@@ -1,0 +1,49 @@
+bundle:
+  name: bundle_20260530
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Catalogo Unity Catalog principal
+    default: fintech_finpay
+
+  schema:
+    description: Schema base donde publica el Lakeflow Pipeline
+    default: silver
+
+  warehouse_id:
+    description: SQL Warehouse para refrescar Materialized Views
+    default: "ea1536717738de7c"
+
+  pipeline_development:
+    description: Define si el Lakeflow Pipeline corre en modo development
+    default: true
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-b250abfc-ff6b.cloud.databricks.com
+      root_path: /Workspace/Users/gianinacuni@gmail.com/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: fintech_finpay
+      schema: silver
+      warehouse_id: "ea1536717738de7c"
+      pipeline_development: true
+
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-b250abfc-ff6b.cloud.databricks.com
+      root_path: /Workspace/Users/gianinacuni@gmail.com/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: fintech_finpay
+      schema: silver
+      warehouse_id: "ea1536717738de7c"
+      pipeline_development: false
+    permissions:
+      - user_name: gianinacuni@gmail.com
+        level: CAN_MANAGE

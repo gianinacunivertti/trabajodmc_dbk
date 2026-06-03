@@ -1,384 +1,340 @@
 # ============================================================
 # gold.py
 # Proyecto FinPay - Lakehouse Fraud Detection
-# Capa Gold: KPIs de riesgo, tasas de reversa y anomalías
+# Capa Gold
+# Un solo Lakeflow Pipeline escribiendo en fintech_finpay.gold
 # ============================================================
 
 from pyspark import pipelines as dp
+from pyspark.sql import functions as F
 
-from pyspark.sql.functions import (
-    col,
-    count,
-    countDistinct,
-    sum as spark_sum,
-    avg,
-    max as spark_max,
-    min as spark_min,
-    when,
-    lit,
-    dayofmonth,
-    month,
-    quarter,
-    year
-)
-
-from src.utils import (
+from utils import (
     SILVER_TRANSACTIONS,
     SILVER_MERCHANTS,
     SILVER_USERS,
     GOLD_RISK_KPIS_BY_MERCHANT_CHANNEL,
-    GOLD_DAILY_RISK_SUMMARY,
+    GOLD_DAILY_REVERSAL_RATE,
     GOLD_MERCHANT_ANOMALY_CANDIDATES,
-    GOLD_USER_RISK_SUMMARY,
-    GOLD_COUNTRY_CATEGORY_RISK_SUMMARY,
-    GOLD_DATE_SUMMARY
+    GOLD_USER_CHANNEL_SUMMARY,
 )
 
 
 # ============================================================
-# GOLD: KPIs DE RIESGO POR COMERCIO, CANAL Y FECHA
+# GOLD - RISK KPIS BY MERCHANT CHANNEL
 # ============================================================
 
-@dp.materialized_view(
+@dp.table(
     name=GOLD_RISK_KPIS_BY_MERCHANT_CHANNEL,
-    comment="KPIs Gold de riesgo por comercio, canal y fecha"
+    comment="KPIs de riesgo por comercio, canal, fecha y moneda.",
+    table_properties={
+        "quality": "gold",
+        "delta.enableChangeDataFeed": "true",
+    },
 )
-def gold_risk_kpis_by_merchant_channel():
-    transactions = spark.read.table(SILVER_TRANSACTIONS)
-    merchants = spark.read.table(SILVER_MERCHANTS)
+def risk_kpis_by_merchant_channel():
+    transactions_df = spark.read.table(SILVER_TRANSACTIONS)
+    merchants_df = spark.read.table(SILVER_MERCHANTS)
 
-    base = (
-        transactions.alias("t")
+    base_df = (
+        transactions_df
         .join(
-            merchants.alias("m"),
-            col("t.merchant_id") == col("m.merchant_id"),
-            "left"
+            merchants_df.select(
+                "merchant_id",
+                "merchant_name",
+                "category",
+                "country",
+                "risk_level",
+            ),
+            on="merchant_id",
+            how="left",
         )
     )
 
-    return (
-        base.groupBy(
-            col("t.transaction_date").alias("transaction_date"),
-            col("t.merchant_id").alias("merchant_id"),
-            col("m.merchant_name").alias("merchant_name"),
-            col("m.category").alias("merchant_category"),
-            col("m.country").alias("merchant_country"),
-            col("m.risk_level").alias("merchant_risk_level"),
-            col("t.channel").alias("channel")
+    result_df = (
+        base_df
+        .groupBy(
+            "transaction_date",
+            "merchant_id",
+            "merchant_name",
+            "category",
+            "country",
+            "channel",
+            "currency",
         )
         .agg(
-            count("*").alias("transaction_count"),
-            countDistinct("t.user_id").alias("unique_users"),
-            spark_sum("t.amount_value").alias("total_amount"),
-            avg("t.amount_value").alias("avg_amount"),
-            spark_max("t.amount_value").alias("max_amount"),
-            spark_min("t.amount_value").alias("min_amount"),
-            spark_sum(
-                when(col("t.transaction_type") == "pago", lit(1)).otherwise(lit(0))
-            ).alias("payment_count"),
-            spark_sum(
-                when(col("t.transaction_type") == "reversa", lit(1)).otherwise(lit(0))
-            ).alias("reversal_count"),
-            spark_sum(
-                when(col("t.transaction_type") == "retiro", lit(1)).otherwise(lit(0))
-            ).alias("withdrawal_count"),
-            spark_sum(
-                when(col("t.status") == "rechazado", lit(1)).otherwise(lit(0))
-            ).alias("rejected_count"),
-            spark_sum(
-                when(col("t.status") == "pendiente", lit(1)).otherwise(lit(0))
-            ).alias("pending_count"),
-            spark_sum(
-                when(col("t.status") == "aprobado", lit(1)).otherwise(lit(0))
-            ).alias("approved_count")
+            F.count("*").alias("transaction_count"),
+            F.sum(F.when(F.col("transaction_type") == "pago", 1).otherwise(0)).alias("payment_count"),
+            F.sum(F.when(F.col("transaction_type") == "reversa", 1).otherwise(0)).alias("reversal_count"),
+            F.sum(F.when(F.col("transaction_type") == "retiro", 1).otherwise(0)).alias("withdrawal_count"),
+            F.sum(F.when(F.col("status") == "aprobado", 1).otherwise(0)).alias("approved_count"),
+            F.sum(F.when(F.col("status") == "rechazado", 1).otherwise(0)).alias("rejected_count"),
+            F.sum(F.when(F.col("status") == "pendiente", 1).otherwise(0)).alias("pending_count"),
+            F.round(F.sum("amount"), 2).alias("total_amount"),
+            F.round(F.avg("amount"), 2).alias("avg_amount"),
         )
         .withColumn(
             "reversal_rate",
-            col("reversal_count") / col("transaction_count")
+            F.round(
+                F.col("reversal_count")
+                / F.when(F.col("transaction_count") == 0, None).otherwise(F.col("transaction_count")),
+                4,
+            ),
         )
         .withColumn(
-            "rejection_rate",
-            col("rejected_count") / col("transaction_count")
+            "rejected_rate",
+            F.round(
+                F.col("rejected_count")
+                / F.when(F.col("transaction_count") == 0, None).otherwise(F.col("transaction_count")),
+                4,
+            ),
         )
         .withColumn(
-            "pending_rate",
-            col("pending_count") / col("transaction_count")
+            "amount_risk_factor",
+            F.when(F.col("avg_amount") >= 1000, F.lit(1.0))
+            .when(F.col("avg_amount") >= 500, F.lit(0.5))
+            .otherwise(F.lit(0.0)),
         )
         .withColumn(
             "risk_score",
-            (
-                col("reversal_rate") * lit(0.50)
-                + col("rejection_rate") * lit(0.30)
-                + col("pending_rate") * lit(0.10)
-                + when(col("merchant_risk_level") == "alto", lit(0.10))
-                  .when(col("merchant_risk_level") == "medio", lit(0.05))
-                  .otherwise(lit(0.00))
-            )
+            F.round(
+                (F.coalesce(F.col("reversal_rate"), F.lit(0.0)) * F.lit(0.50))
+                + (F.coalesce(F.col("rejected_rate"), F.lit(0.0)) * F.lit(0.30))
+                + (F.col("amount_risk_factor") * F.lit(0.20)),
+                4,
+            ),
         )
         .withColumn(
-            "risk_band",
-            when(col("risk_score") >= lit(0.50), lit("alto"))
-            .when(col("risk_score") >= lit(0.25), lit("medio"))
-            .otherwise(lit("bajo"))
+            "calculated_risk_level",
+            F.when(F.col("risk_score") >= 0.70, F.lit("alto"))
+            .when(F.col("risk_score") >= 0.40, F.lit("medio"))
+            .otherwise(F.lit("bajo")),
         )
+        .withColumn("gold_processing_timestamp", F.current_timestamp())
     )
 
+    return result_df
+
 
 # ============================================================
-# GOLD: RESUMEN DIARIO DE RIESGO
+# GOLD - DAILY REVERSAL RATE
 # ============================================================
 
-@dp.materialized_view(
-    name=GOLD_DAILY_RISK_SUMMARY,
-    comment="Resumen diario Gold de riesgo por canal, tipo de transaccion y moneda"
+@dp.table(
+    name=GOLD_DAILY_REVERSAL_RATE,
+    comment="Tasa diaria de reversas por pais, categoria, canal y moneda.",
+    table_properties={
+        "quality": "gold",
+        "delta.enableChangeDataFeed": "true",
+    },
 )
-def gold_daily_risk_summary():
-    transactions = spark.read.table(SILVER_TRANSACTIONS)
+def daily_reversal_rate():
+    transactions_df = spark.read.table(SILVER_TRANSACTIONS)
+    merchants_df = spark.read.table(SILVER_MERCHANTS)
 
-    return (
-        transactions
-        .groupBy(
-            col("transaction_date"),
-            col("channel"),
-            col("transaction_type"),
-            col("currency")
-        )
-        .agg(
-            count("*").alias("transaction_count"),
-            countDistinct("user_id").alias("unique_users"),
-            countDistinct("merchant_id").alias("unique_merchants"),
-            spark_sum("amount_value").alias("total_amount"),
-            avg("amount_value").alias("avg_amount"),
-            spark_sum(
-                when(col("status") == "aprobado", lit(1)).otherwise(lit(0))
-            ).alias("approved_count"),
-            spark_sum(
-                when(col("status") == "rechazado", lit(1)).otherwise(lit(0))
-            ).alias("rejected_count"),
-            spark_sum(
-                when(col("status") == "pendiente", lit(1)).otherwise(lit(0))
-            ).alias("pending_count"),
-            spark_sum(
-                when(col("transaction_type") == "reversa", lit(1)).otherwise(lit(0))
-            ).alias("reversal_count")
-        )
-        .withColumn(
-            "rejection_rate",
-            col("rejected_count") / col("transaction_count")
-        )
-        .withColumn(
-            "reversal_rate",
-            col("reversal_count") / col("transaction_count")
-        )
-        .withColumn(
-            "pending_rate",
-            col("pending_count") / col("transaction_count")
-        )
-    )
-
-
-# ============================================================
-# GOLD: CANDIDATOS DE ANOMALIA POR COMERCIO Y CANAL
-# ============================================================
-
-@dp.materialized_view(
-    name=GOLD_MERCHANT_ANOMALY_CANDIDATES,
-    comment="Comercios candidatos a anomalia por tasas altas de reversa, rechazo o score de riesgo"
-)
-def gold_merchant_anomaly_candidates():
-    kpis = spark.read.table(GOLD_RISK_KPIS_BY_MERCHANT_CHANNEL)
-
-    return (
-        kpis
-        .where(
-            (col("reversal_rate") >= lit(0.20))
-            | (col("rejection_rate") >= lit(0.20))
-            | (col("risk_score") >= lit(0.25))
-            | (col("transaction_count") >= lit(50))
-            | (col("total_amount") >= lit(10000))
-        )
-        .select(
-            col("transaction_date"),
-            col("merchant_id"),
-            col("merchant_name"),
-            col("merchant_category"),
-            col("merchant_country"),
-            col("merchant_risk_level"),
-            col("channel"),
-            col("transaction_count"),
-            col("unique_users"),
-            col("total_amount"),
-            col("avg_amount"),
-            col("max_amount"),
-            col("payment_count"),
-            col("reversal_count"),
-            col("withdrawal_count"),
-            col("rejected_count"),
-            col("pending_count"),
-            col("approved_count"),
-            col("reversal_rate"),
-            col("rejection_rate"),
-            col("pending_rate"),
-            col("risk_score"),
-            col("risk_band")
-        )
-    )
-
-
-# ============================================================
-# GOLD: RIESGO POR USUARIO
-# ============================================================
-
-@dp.materialized_view(
-    name=GOLD_USER_RISK_SUMMARY,
-    comment="Resumen Gold de comportamiento transaccional y riesgo por usuario"
-)
-def gold_user_risk_summary():
-    transactions = spark.read.table(SILVER_TRANSACTIONS)
-    users = spark.read.table(SILVER_USERS)
-
-    base = (
-        transactions.alias("t")
+    base_df = (
+        transactions_df
         .join(
-            users.alias("u"),
-            col("t.user_id") == col("u.user_id"),
-            "left"
+            merchants_df.select(
+                "merchant_id",
+                "country",
+                "category",
+                "risk_level",
+            ),
+            on="merchant_id",
+            how="left",
         )
     )
 
-    return (
-        base.groupBy(
-            col("t.user_id").alias("user_id"),
-            col("u.country").alias("user_country"),
-            col("u.segment").alias("user_segment")
+    result_df = (
+        base_df
+        .groupBy(
+            "transaction_date",
+            "country",
+            "category",
+            "channel",
+            "currency",
         )
         .agg(
-            count("*").alias("transaction_count"),
-            countDistinct("t.merchant_id").alias("unique_merchants"),
-            countDistinct("t.channel").alias("unique_channels"),
-            spark_sum("t.amount_value").alias("total_amount"),
-            avg("t.amount_value").alias("avg_amount"),
-            spark_max("t.amount_value").alias("max_amount"),
-            spark_sum(
-                when(col("t.transaction_type") == "pago", lit(1)).otherwise(lit(0))
-            ).alias("payment_count"),
-            spark_sum(
-                when(col("t.transaction_type") == "reversa", lit(1)).otherwise(lit(0))
-            ).alias("reversal_count"),
-            spark_sum(
-                when(col("t.transaction_type") == "retiro", lit(1)).otherwise(lit(0))
-            ).alias("withdrawal_count"),
-            spark_sum(
-                when(col("t.status") == "rechazado", lit(1)).otherwise(lit(0))
-            ).alias("rejected_count")
+            F.count("*").alias("transaction_count"),
+            F.sum(F.when(F.col("transaction_type") == "reversa", 1).otherwise(0)).alias("reversal_count"),
+            F.sum(F.when(F.col("status") == "rechazado", 1).otherwise(0)).alias("rejected_count"),
+            F.round(F.sum("amount"), 2).alias("total_amount"),
+            F.round(F.avg("amount"), 2).alias("avg_amount"),
         )
         .withColumn(
             "reversal_rate",
-            col("reversal_count") / col("transaction_count")
+            F.round(
+                F.col("reversal_count")
+                / F.when(F.col("transaction_count") == 0, None).otherwise(F.col("transaction_count")),
+                4,
+            ),
         )
         .withColumn(
-            "rejection_rate",
-            col("rejected_count") / col("transaction_count")
+            "rejected_rate",
+            F.round(
+                F.col("rejected_count")
+                / F.when(F.col("transaction_count") == 0, None).otherwise(F.col("transaction_count")),
+                4,
+            ),
+        )
+        .withColumn("gold_processing_timestamp", F.current_timestamp())
+    )
+
+    return result_df
+
+
+# ============================================================
+# GOLD - MERCHANT ANOMALY CANDIDATES
+# ============================================================
+
+@dp.table(
+    name=GOLD_MERCHANT_ANOMALY_CANDIDATES,
+    comment="Comercios candidatos a anomalia por tasa de reversa, rechazo o score de riesgo.",
+    table_properties={
+        "quality": "gold",
+        "delta.enableChangeDataFeed": "true",
+    },
+)
+def merchant_anomaly_candidates():
+    kpis_df = spark.read.table(GOLD_RISK_KPIS_BY_MERCHANT_CHANNEL)
+
+    result_df = (
+        kpis_df
+        .withColumn(
+            "is_anomaly_candidate",
+            F.when(
+                (F.col("reversal_rate") >= 0.30)
+                | (F.col("risk_score") >= 0.70)
+                | (
+                    (F.col("avg_amount") >= 1000)
+                    & (F.col("rejected_rate") >= 0.20)
+                ),
+                F.lit(True),
+            ).otherwise(F.lit(False)),
+        )
+        .withColumn(
+            "anomaly_reason",
+            F.when(F.col("reversal_rate") >= 0.30, F.lit("high_reversal_rate"))
+            .when(F.col("risk_score") >= 0.70, F.lit("high_risk_score"))
+            .when(
+                (F.col("avg_amount") >= 1000)
+                & (F.col("rejected_rate") >= 0.20),
+                F.lit("high_amount_and_rejected_rate"),
+            )
+            .otherwise(F.lit("normal")),
+        )
+        .filter(F.col("is_anomaly_candidate") == True)
+        .select(
+            "transaction_date",
+            "merchant_id",
+            "merchant_name",
+            "category",
+            "country",
+            "channel",
+            "currency",
+            "transaction_count",
+            "payment_count",
+            "reversal_count",
+            "withdrawal_count",
+            "approved_count",
+            "rejected_count",
+            "pending_count",
+            "total_amount",
+            "avg_amount",
+            "reversal_rate",
+            "rejected_rate",
+            "risk_score",
+            "calculated_risk_level",
+            "is_anomaly_candidate",
+            "anomaly_reason",
+            "gold_processing_timestamp",
+        )
+    )
+
+    return result_df
+
+
+# ============================================================
+# GOLD - USER CHANNEL SUMMARY
+# ============================================================
+
+@dp.table(
+    name=GOLD_USER_CHANNEL_SUMMARY,
+    comment="Resumen de comportamiento transaccional por usuario y canal.",
+    table_properties={
+        "quality": "gold",
+        "delta.enableChangeDataFeed": "true",
+    },
+)
+def user_channel_summary():
+    transactions_df = spark.read.table(SILVER_TRANSACTIONS)
+    users_df = spark.read.table(SILVER_USERS)
+
+    base_df = (
+        transactions_df
+        .join(
+            users_df.select(
+                "user_id",
+                "country",
+                "segment",
+                "registration_date",
+            ),
+            on="user_id",
+            how="left",
+        )
+    )
+
+    result_df = (
+        base_df
+        .groupBy(
+            "user_id",
+            "country",
+            "segment",
+            "channel",
+        )
+        .agg(
+            F.count("*").alias("transaction_count"),
+            F.sum(F.when(F.col("transaction_type") == "pago", 1).otherwise(0)).alias("payment_count"),
+            F.sum(F.when(F.col("transaction_type") == "reversa", 1).otherwise(0)).alias("reversal_count"),
+            F.sum(F.when(F.col("transaction_type") == "retiro", 1).otherwise(0)).alias("withdrawal_count"),
+            F.sum(F.when(F.col("status") == "aprobado", 1).otherwise(0)).alias("approved_count"),
+            F.sum(F.when(F.col("status") == "rechazado", 1).otherwise(0)).alias("rejected_count"),
+            F.round(F.sum("amount"), 2).alias("total_amount"),
+            F.round(F.avg("amount"), 2).alias("avg_amount"),
+            F.min("transaction_date").alias("first_transaction_date"),
+            F.max("transaction_date").alias("last_transaction_date"),
+        )
+        .withColumn(
+            "reversal_rate",
+            F.round(
+                F.col("reversal_count")
+                / F.when(F.col("transaction_count") == 0, None).otherwise(F.col("transaction_count")),
+                4,
+            ),
+        )
+        .withColumn(
+            "rejected_rate",
+            F.round(
+                F.col("rejected_count")
+                / F.when(F.col("transaction_count") == 0, None).otherwise(F.col("transaction_count")),
+                4,
+            ),
         )
         .withColumn(
             "user_risk_score",
-            (
-                col("reversal_rate") * lit(0.50)
-                + col("rejection_rate") * lit(0.30)
-                + when(col("max_amount") >= lit(5000), lit(0.20))
-                  .otherwise(lit(0.00))
-            )
+            F.round(
+                (F.coalesce(F.col("reversal_rate"), F.lit(0.0)) * F.lit(0.60))
+                + (F.coalesce(F.col("rejected_rate"), F.lit(0.0)) * F.lit(0.40)),
+                4,
+            ),
         )
         .withColumn(
-            "user_risk_band",
-            when(col("user_risk_score") >= lit(0.50), lit("alto"))
-            .when(col("user_risk_score") >= lit(0.25), lit("medio"))
-            .otherwise(lit("bajo"))
+            "calculated_user_risk_level",
+            F.when(F.col("user_risk_score") >= 0.70, F.lit("alto"))
+            .when(F.col("user_risk_score") >= 0.40, F.lit("medio"))
+            .otherwise(F.lit("bajo")),
         )
+        .withColumn("gold_processing_timestamp", F.current_timestamp())
     )
 
-
-# ============================================================
-# GOLD: RESUMEN POR PAIS Y CATEGORIA DE COMERCIO
-# ============================================================
-
-@dp.materialized_view(
-    name=GOLD_COUNTRY_CATEGORY_RISK_SUMMARY,
-    comment="Resumen Gold de riesgo por pais y categoria de comercio"
-)
-def gold_country_category_risk_summary():
-    kpis = spark.read.table(GOLD_RISK_KPIS_BY_MERCHANT_CHANNEL)
-
-    return (
-        kpis
-        .groupBy(
-            col("merchant_country"),
-            col("merchant_category"),
-            col("channel"),
-            col("transaction_date")
-        )
-        .agg(
-            spark_sum("transaction_count").alias("transaction_count"),
-            spark_sum("unique_users").alias("unique_users_approx"),
-            spark_sum("total_amount").alias("total_amount"),
-            avg("avg_amount").alias("avg_amount"),
-            spark_sum("reversal_count").alias("reversal_count"),
-            spark_sum("rejected_count").alias("rejected_count"),
-            avg("risk_score").alias("avg_risk_score")
-        )
-        .withColumn(
-            "reversal_rate",
-            col("reversal_count") / col("transaction_count")
-        )
-        .withColumn(
-            "rejection_rate",
-            col("rejected_count") / col("transaction_count")
-        )
-        .withColumn(
-            "risk_band",
-            when(col("avg_risk_score") >= lit(0.50), lit("alto"))
-            .when(col("avg_risk_score") >= lit(0.25), lit("medio"))
-            .otherwise(lit("bajo"))
-        )
-    )
-
-
-# ============================================================
-# GOLD: RESUMEN POR FECHA
-# ============================================================
-
-@dp.materialized_view(
-    name=GOLD_DATE_SUMMARY,
-    comment="Resumen Gold por fecha con atributos calendario basicos"
-)
-def gold_date_summary():
-    transactions = spark.read.table(SILVER_TRANSACTIONS)
-
-    return (
-        transactions
-        .groupBy(
-            col("transaction_date")
-        )
-        .agg(
-            count("*").alias("transaction_count"),
-            spark_sum("amount_value").alias("total_amount"),
-            spark_sum(
-                when(col("transaction_type") == "reversa", lit(1)).otherwise(lit(0))
-            ).alias("reversal_count"),
-            spark_sum(
-                when(col("status") == "rechazado", lit(1)).otherwise(lit(0))
-            ).alias("rejected_count")
-        )
-        .withColumn("day", dayofmonth(col("transaction_date")))
-        .withColumn("month", month(col("transaction_date")))
-        .withColumn("quarter", quarter(col("transaction_date")))
-        .withColumn("year", year(col("transaction_date")))
-        .withColumn(
-            "reversal_rate",
-            col("reversal_count") / col("transaction_count")
-        )
-        .withColumn(
-            "rejection_rate",
-            col("rejected_count") / col("transaction_count")
-        )
-    )
+    return result_df

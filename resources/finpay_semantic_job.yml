@@ -1,0 +1,12 @@
+resources:
+  jobs:
+    finpay_semantic_job:
+      name: finpay_semantic_job
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: refresh_materialized_views
+          sql_task:
+            file:
+              path: ../sql/02_refresh_materialized_views.sql
+            warehouse_id: ${var.warehouse_id}

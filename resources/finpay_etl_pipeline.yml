@@ -1,23 +1,26 @@
 resources:
   pipelines:
     finpay_etl_pipeline:
-      name: finpay_etl_pipeline
-      catalog: fintech_finpay
-      schema: bronze
-      development: true
-      continuous: false
+      name: ${bundle.target}_finpay_etl_pipeline
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+
       serverless: true
+      development: ${var.pipeline_development}
+      continuous: false
+      channel: CURRENT
+      photon: true
 
       libraries:
+        - file:
+            path: ../src/utils.py
         - file:
             path: ../src/bronze.py
         - file:
             path: ../src/silver.py
         - file:
             path: ../src/gold.py
-        - file:
-            path: ../src/utils.py
 
       configuration:
-        landing_path: /Volumes/fintech_finpay/default/vol_landing
-        observability_schema: fintech_finpay.observability
+        spark.databricks.delta.schema.autoMerge.enabled: "true"
+        finpay.catalog: "${var.catalog}"
